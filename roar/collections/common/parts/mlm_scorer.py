@@ -31,7 +31,8 @@ class MLMScorer:
         """
         returns MLM score for sentence.
         """
-        assert type(sentence) == str
+        # assert type(sentence) == str
+        assert isinstance(sentence, str)
 
         tokens = self.tokenizer.tokenize(sentence)
         mask_idx = []

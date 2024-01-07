@@ -7,9 +7,10 @@ import torch.nn.functional as F
 from roar.collections.tts.modules.submodules import (
     ConditionalInput,
     ConditionalLayerNorm,
+    ConditionalRMSNorm,
     LinearNorm,
 )
-from roar.collections.tts.modules.attention import MultiHeadAttn, MultiHeadAttnFlash
+from roar.collections.tts.modules.attention import MultiHeadAttn
 from roar.collections.tts.modules.postional_embedding import PositionalEmbedding
 from roar.collections.tts.parts.utils.helpers import get_mask_from_lengths
 from roar.core.classes import NeuralModule, adapter_mixins, typecheck
@@ -25,7 +26,7 @@ from roar.utils import logging
 
 HAVE_FLASH = True
 try:
-    from flash_attn import flash_attn_qkvpacked_func
+    from roar.collections.tts.modules.attention import MultiHeadAttnFlash
 except ImportError:
     HAVE_FLASH = False
 
@@ -50,6 +51,15 @@ class PositionwiseConvFF(nn.Module):
         condition_types=[],
     ):
         super(PositionwiseConvFF, self).__init__()
+        assert not (
+            "rmsnorm" in condition_types and "layernorm" in condition_types
+        ), "Cannot use both LayerNorm and RMSNorm"
+
+        NormalizationBlock = (
+            ConditionalLayerNorm
+            if "layernorm" in condition_types
+            else ConditionalRMSNorm
+        )
 
         self.d_model = d_model
         self.d_inner = d_inner
@@ -65,7 +75,7 @@ class PositionwiseConvFF(nn.Module):
             nn.Conv1d(d_inner, d_model, kernel_size[1], 1, (kernel_size[1] // 2)),
             nn.Dropout(dropout),
         )
-        self.layer_norm = ConditionalLayerNorm(
+        self.layer_norm = NormalizationBlock(
             d_model, condition_dim=d_model, condition_types=condition_types
         )
         self.pre_lnorm = pre_lnorm
@@ -106,7 +116,7 @@ class TransformerLayer(nn.Module, adapter_mixins.AdapterModuleMixin):
         kernel_size,
         dropout,
         condition_types=[],
-        **kwargs
+        **kwargs,
     ):  # TODO: add flash attention support for transformer
         super(TransformerLayer, self).__init__()
         AttentionBlock = MultiHeadAttn
@@ -213,7 +223,9 @@ class FFTransformerDecoder(NeuralModule):
         return self._forward(input, mask_from_lens(seq_lens).unsqueeze(2), conditioning)
 
     def _forward(self, inp, mask, conditioning):
-        pos_seq = torch.arange(inp.size(1), device=inp.device).to(inp.dtype)
+        pos_seq = torch.arange(inp.size(1), device=inp.device).to(
+            inp.dtype
+        )  # refactor as in lucidrains clip
         pos_emb = self.pos_emb(pos_seq) * mask
         inp += pos_emb
         inp = self.cond_input(inp, conditioning)

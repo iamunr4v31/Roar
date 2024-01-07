@@ -2,17 +2,18 @@ import string
 from abc import ABC, abstractmethod
 
 # from contextlib import contextmanager
-from typing import List, Optional
+from typing import List
+from functools import partial
 
-# from roar.collections.common.tokenizers.text_to_speech.ipa_lexicon import (
-#     get_grapheme_character_set,
-#     get_ipa_punctuation_list,
-#     validate_locale,
-# )
+import phonemizer
+
 from roar.collections.common.tokenizers.text_to_speech.tokenizer_utils import (
     any_locale_text_preprocessing,
     english_text_preprocessing,
     get_characters_from_range,
+)
+from roar.collections.common.tokenizers.text_to_speech.unicode_lexicon import (
+    get_unicode_character_set,
 )
 from roar.utils import logging
 from roar.utils.decorators import experimental
@@ -43,9 +44,10 @@ class BaseTokenizer(ABC):
         self.pad, tokens = len(tokens), tokens + [pad]  # Padding
 
         if add_blank_at is not None:
-            self.blank, tokens = len(tokens), tokens + [
-                blank
-            ]  # Reserved for blank from asr-model
+            self.blank, tokens = (
+                len(tokens),
+                tokens + [blank],
+            )  # Reserved for blank from asr-model
         else:
             # use add_blank_at=None only for ASR where blank is added automatically, disable blank here
             self.blank = None
@@ -160,6 +162,248 @@ class BaseCharsTokenizer(BaseTokenizer):
         return [self._token2id[p] for p in cs]
 
 
+class BasePhonemeTokenizer(BaseTokenizer):
+    # fmt: off
+    # TODO: unify definition of the default PUNCT_LIST and import from ipa_lexicon.py
+    PUNCT_LIST = (  # Derived from LJSpeech and "/" additionally
+        ',', '.', '!', '?', '-',
+        ':', ';', '/', '"', '(',
+        ')', '[', ']', '{', '}',
+    )
+    # fmt: on
+
+    UNICODE_RANGES = [
+        ("\u0250", "\u02AF"),
+        ("\u1D80", "\u1DBF"),
+        ("\u02B0", "\u02BF"),
+    ]
+
+    def __init__(
+        self,
+        g2p,
+        punct=True,
+        apostrophe=True,
+        add_blank_at=None,
+        pad_with_space=False,
+        non_default_punct_list=None,
+        text_preprocessing_func=lambda x: x,
+    ):
+        """Base class for phoneme-based tokenizer.
+        Args:
+            phonemes: string that represents all possible phoneme.
+            punct: Whether to reserve grapheme for basic punctuation or not.
+            apostrophe: Whether to use apostrophe or not.
+            add_blank_at: Add blank to labels in the specified order ("last") or after tokens (any non None),
+                if None then no blank in labels.
+            pad_with_space: Whether to pad text with spaces at the beginning and at the end or not.
+            non_default_punct_list: List of punctuation marks which will be used instead default.
+            text_preprocessing_func: Text preprocessing function for correct execution of the tokenizer.
+        """
+
+        tokens = []
+        self.space, tokens = len(tokens), tokens + [" "]  # Space
+        tokens.extend(map(get_characters_from_range, self.UNICODE_RANGES))
+        tokens.extend(string.ascii_letters)
+        if apostrophe:
+            tokens.append("'")  # Apostrophe for saving "don't" and "Joe's"
+
+        if punct:
+            if non_default_punct_list is not None:
+                self.PUNCT_LIST = non_default_punct_list
+            tokens.extend(self.PUNCT_LIST)
+
+        super().__init__(tokens, add_blank_at=add_blank_at)
+
+        self.punct = punct
+        self.pad_with_space = pad_with_space
+        self.g2p = g2p
+        self.text_preprocessing_func = text_preprocessing_func
+        unicode_range = get_unicode_character_set(self.g2p.language)
+        self.text_token_range = lambda x: unicode_range[0] <= x <= unicode_range[1]
+        self.in_unicode_range = lambda x, l, u: l <= x <= u
+
+    def encode(self, text):
+        """See base class."""
+        cs, space, tokens = [], self.tokens[self.space], set(self.tokens)
+
+        text = self.text_preprocessing_func(text)
+        assert all(map(self.text_token_range, text)), (
+            f"Text: [{text}] contains characters outside of the unicode range "
+            f"{self.text_token_range.__closure__[0].cell_contents}."
+        )
+        text = self.g2p.phonemize(text)
+        for c in text:
+            in_unicode_range = partial(self.in_unicode_range, x=c)
+            # Add a whitespace if the current char is a whitespace while the previous char is not a whitespace.
+            if c == space and len(cs) > 0 and cs[-1] != space:
+                cs.append(c)
+            # Add the current char that is an alphanumeric or an apostrophe.
+            elif (
+                any(map(in_unicode_range, self.UNICODE_RANGES)) or c == "'"
+            ) and c in tokens:
+                cs.append(c)
+            # Add a punctuation that has a single char.
+            elif (c in self.PUNCT_LIST) and self.punct:
+                cs.append(c)
+            # Warn about unknown char
+            elif c != space:
+                logging.warning(
+                    f"Text: [{text}] contains unknown char: [{c}]. Symbol will be skipped."
+                )
+
+        # Remove trailing spaces
+        if cs:
+            while cs[-1] == space:
+                cs.pop()
+
+        if self.pad_with_space:
+            cs = [space] + cs + [space]
+
+        return [self._token2id[p] for p in cs]
+
+
+@experimental
+class EnglishPhonemesTokenizer(BasePhonemeTokenizer):
+    __name__ = "EnglishPhonemesTokenizer"
+    # fmt: off
+    PUNCT_LIST = (  # Derived from LJSpeech and "/" additionally
+        ',', '.', '!', '?', '-',
+        ':', ';', '/', '"', '(',
+        ')', '[', ']', '{', '}', 
+        '%', '$', '#',
+    )
+    # fmt: on
+
+    def __init__(
+        self,
+        lang_code="en-us",
+        punct=True,
+        apostrophe=True,
+        add_blank_at=None,
+        pad_with_space=False,
+        non_default_punct_list=None,
+        text_preprocessing_func=lambda x: x,
+    ):
+        """Phoneme-based tokenizer.
+
+        Args:
+            phonemizer (EspeakBackend): phonemizer that uses espeak-ng
+            lang_code: Language code corresponding to espeak-ng language code.
+            punct: Whether to reserve grapheme for basic punctuation or not.
+            apostrophe: Whether to use apostrophe or not.
+            add_blank_at: Add blank to labels in the specified order ("last") or after tokens (any non None),
+                if None then no blank in labels.
+            pad_with_space: Whether to pad text with spaces at the beginning and at the end or not.
+            non_default_punct_list: List of punctuation marks which will be used instead default.
+            text_preprocessing_func: Text preprocessing function for correct execution of the tokenizer.
+        """
+        g2p = phonemizer.backend.EspeakBackend(
+            lang_code=lang_code, preserve_punctuation=True, with_stress=True
+        )
+        super().__init__(
+            g2p=g2p,
+            punct=punct,
+            apostrophe=apostrophe,
+            add_blank_at=add_blank_at,
+            pad_with_space=pad_with_space,
+            non_default_punct_list=non_default_punct_list,
+            text_preprocessing_func=text_preprocessing_func,
+        )
+
+
+@experimental
+class HindiPhonemesTokenizer(BasePhonemeTokenizer):
+    __name__ = "HindiPhonemesTokenizer"
+    # fmt: off
+    PUNCT_LIST = (  # Derived from LJSpeech and "/" additionally
+        ',', '.', '!', '?', '-',
+        ':', ';', '/', '"', '(',
+        ')', '[', ']', '{', '}', 
+        '%', '$', '#',
+    )
+    # fmt: on
+
+    def __init__(
+        self,
+        punct=True,
+        apostrophe=True,
+        add_blank_at=None,
+        pad_with_space=False,
+        non_default_punct_list=None,
+        text_preprocessing_func=lambda x: x,
+    ):
+        """Phoneme-based tokenizer.
+
+        Args:
+            phonemizer (EspeakBackend): phonemizer that uses espeak-ng
+            lang_code: Language code corresponding to espeak-ng language code.
+            punct: Whether to reserve grapheme for basic punctuation or not.
+            apostrophe: Whether to use apostrophe or not.
+            add_blank_at: Add blank to labels in the specified order ("last") or after tokens (any non None),
+                if None then no blank in labels.
+            pad_with_space: Whether to pad text with spaces at the beginning and at the end or not.
+            non_default_punct_list: List of punctuation marks which will be used instead default.
+            text_preprocessing_func: Text preprocessing function for correct execution of the tokenizer.
+        """
+        g2p = phonemizer.backend.EspeakBackend("hi", preserve_punctuation=True)
+        super().__init__(
+            g2p=g2p,
+            punct=punct,
+            apostrophe=apostrophe,
+            add_blank_at=add_blank_at,
+            pad_with_space=pad_with_space,
+            non_default_punct_list=non_default_punct_list,
+            text_preprocessing_func=text_preprocessing_func,
+        )
+
+
+@experimental
+class TamilPhonemesTokenizer(BasePhonemeTokenizer):
+    __name__ = "TamilPhonemesTokenizer"
+    # fmt: off
+    PUNCT_LIST = (  # Derived from LJSpeech and "/" additionally
+        ',', '.', '!', '?', '-',
+        ':', ';', '/', '"', '(',
+        ')', '[', ']', '{', '}', 
+        '%', '$', '#',
+    )
+    # fmt: on
+
+    def __init__(
+        self,
+        punct=True,
+        apostrophe=True,
+        add_blank_at=None,
+        pad_with_space=False,
+        non_default_punct_list=None,
+        text_preprocessing_func=lambda x: x,
+    ):
+        """Phoneme-based tokenizer.
+
+        Args:
+            phonemizer (EspeakBackend): phonemizer that uses espeak-ng
+            lang_code: Language code corresponding to espeak-ng language code.
+            punct: Whether to reserve grapheme for basic punctuation or not.
+            apostrophe: Whether to use apostrophe or not.
+            add_blank_at: Add blank to labels in the specified order ("last") or after tokens (any non None),
+                if None then no blank in labels.
+            pad_with_space: Whether to pad text with spaces at the beginning and at the end or not.
+            non_default_punct_list: List of punctuation marks which will be used instead default.
+            text_preprocessing_func: Text preprocessing function for correct execution of the tokenizer.
+        """
+        g2p = phonemizer.backend.EspeakBackend("hi", preserve_punctuation=True)
+        super().__init__(
+            g2p=g2p,
+            punct=punct,
+            apostrophe=apostrophe,
+            add_blank_at=add_blank_at,
+            pad_with_space=pad_with_space,
+            non_default_punct_list=non_default_punct_list,
+            text_preprocessing_func=text_preprocessing_func,
+        )
+
+
+@experimental
 class IndicCharsTokenizer(BaseCharsTokenizer):
     __name__ = "IndicCharsTokenizer"
     # fmt: off
@@ -203,7 +447,7 @@ class IndicCharsTokenizer(BaseCharsTokenizer):
             self.in_unicode_range = lambda x: unicode_range[0] <= x <= unicode_range[1]
             chars = get_characters_from_range(*unicode_range)
         else:
-            self.in_unicode_range = lambda x: False
+            self.in_unicode_range = lambda _: True
             chars = [
                 c
                 for c in chars
@@ -262,6 +506,7 @@ class IndicCharsTokenizer(BaseCharsTokenizer):
         return [self._token2id[p] for p in cs]
 
 
+@experimental
 class TamilCharsTokenizer(IndicCharsTokenizer):
     __name__ = "TamilCharsTokenizer"
     UNICODE_RANGE = ("\u0B80", "\u0BFF")
@@ -300,6 +545,7 @@ class TamilCharsTokenizer(IndicCharsTokenizer):
         )
 
 
+@experimental
 class HindiCharsTokenizer(IndicCharsTokenizer):
     __name__ = "HindiCharsTokenizer"
     UNICODE_RANGE = ("\u0900", "\u097F")

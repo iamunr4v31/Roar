@@ -17,7 +17,7 @@ from roar.core.neural_types.neural_type import NeuralType
 from roar.utils import logging
 
 
-SUPPORTED_CONDITION_TYPES = ["add", "concat", "layernorm"]
+SUPPORTED_CONDITION_TYPES = ["add", "concat", "layernorm", "rmsnorm"]
 
 
 def check_support_condition_types(condition_types):
@@ -175,6 +175,7 @@ class ConvNorm(torch.nn.Module, adapter_mixins.AdapterModuleMixin):
             assert kernel_size % 2 == 1
             padding = int(dilation * (kernel_size - 1) / 2)
         self.use_partial_padding = use_partial_padding
+        self.use_weight_norm = use_weight_norm
         conv_fn = torch.nn.Conv1d
         if use_partial_padding:
             conv_fn = PartialConv1d
@@ -190,7 +191,7 @@ class ConvNorm(torch.nn.Module, adapter_mixins.AdapterModuleMixin):
         torch.nn.init.xavier_uniform_(
             self.conv.weight, gain=torch.nn.init.calculate_gain(w_init_gain)
         )
-        if use_weight_norm:
+        if self.use_weight_norm:
             self.conv = torch.nn.utils.weight_norm(self.conv)
         if norm_fn is not None:
             self.norm = norm_fn(out_channels, affine=True)
@@ -213,6 +214,10 @@ class ConvNorm(torch.nn.Module, adapter_mixins.AdapterModuleMixin):
             ret = self.forward_enabled_adapters(ret.transpose(1, 2)).transpose(1, 2)
 
         return ret
+
+    def remove_weight_norm(self):
+        if self.use_weight_norm:
+            torch.nn.utils.remove_weight_norm(self.conv)
 
 
 class LocationLayer(torch.nn.Module):
@@ -345,10 +350,17 @@ class Prenet(torch.nn.Module):
         return x
 
 
-def fused_add_tanh_sigmoid_multiply(input_a, input_b, n_channels_int):
+# def fused_add_tanh_sigmoid_multiply(input_a, input_b, n_channels_int):
+#     in_act = input_a + input_b
+#     t_act = torch.tanh(in_act[:, :n_channels_int, :])
+#     s_act = torch.sigmoid(in_act[:, n_channels_int:, :])
+#     acts = t_act * s_act
+#     return acts
+def fused_add_tanh_sigmoid_multiply(input_a, input_b):
     in_act = input_a + input_b
-    t_act = torch.tanh(in_act[:, :n_channels_int, :])
-    s_act = torch.sigmoid(in_act[:, n_channels_int:, :])
+    t, s = torch.chunk(in_act, chunks=2, dim=1)
+    t_act = torch.tanh(t)
+    s_act = torch.sigmoid(s)
     acts = t_act * s_act
     return acts
 
@@ -528,6 +540,70 @@ class ConditionalLayerNorm(torch.nn.LayerNorm):
         return inputs
 
 
+class ConditionalRMSNorm(torch.nn.LayerNorm):
+    def __init__(self, hidden_dim, condition_dim, condition_types=[]) -> None:
+        """
+        This module is used to condition torch.nn.LayerNorm with rmsnormed input.
+        If we don't have any conditions, this will be a normal LayerNorm.
+        """
+        check_support_condition_types(condition_types)
+        self.condition = "rmsnorm" in condition_types
+        super().__init__(hidden_dim, elementwise_affine=not self.condition)
+
+        if self.condition:
+            self.cond_weight = torch.nn.Linear(condition_dim, hidden_dim)
+            self.cond_bias = torch.nn.Linear(condition_dim, hidden_dim)
+            self.init_parameters()
+
+    def init_parameters(self):
+        torch.nn.init.constant_(self.cond_weight.weight, 0.0)
+        torch.nn.init.constant_(self.cond_weight.bias, 1.0)
+        torch.nn.init.constant_(self.cond_bias.weight, 0.0)
+        torch.nn.init.constant_(self.cond_bias.bias, 0.0)
+
+    def forward(self, inputs, conditioning=None):
+        inputs = torch.nn.functional.normalize(inputs, dim=-2)
+        inputs = super().forward(inputs)
+
+        # Normalize along channel
+        if self.condition:
+            if conditioning is None:
+                raise ValueError(
+                    """You should add additional data types as conditions (e.g. speaker id or reference audio) 
+                                and define speaker_encoder in your config."""
+                )
+
+            inputs = inputs * self.cond_weight(conditioning)
+            inputs = inputs + self.cond_bias(conditioning)
+
+        return inputs
+
+
+# class RMSNorm(NeuralModule):
+#     def __init__(self, dim, scale=True, dim_cond=None) -> None:
+#         super().__init__()
+#         self.gamma_beta_proj = nn.Linear(dim_cond, dim * 2) if dim_cond else None
+#         self.scale = dim**0.5 if scale else 1.0
+#         self.gamma = nn.Parameter(torch.ones(dim)) if scale else nn.Identity()
+
+#     @property
+#     def input_types(self):
+#         return {
+#             "x": NeuralType(("B", "D", "T"), EncodedRepresentation()),
+#             "conditioning": NeuralType(
+#                 ("B", "D"), EncodedRepresentation(), optional=True
+#             ),
+#         }
+
+#     def forward(self, x, conditioning=None):
+#         x = F.normalize(x, dim=-2) * self.scale * self.gamma
+#         if self.gamma_beta_proj:
+#             gamma, beta = self.gamma_beta_proj(conditioning).chunk(2, dim=-1)
+#             gamma, beta = map(lambda t: rearrange(t, "b d -> b d 1"), (gamma, beta))
+#             x = x * gamma + beta
+#         return x
+
+
 class ConditionalInput(torch.nn.Module):
     """
     This module is used to condition any model inputs.
@@ -577,13 +653,20 @@ class ConditionalInput(torch.nn.Module):
 
 
 class StyleAttention(NeuralModule):
-    def __init__(self, gst_size=128, n_style_token=10, n_style_attn_head=4):
+    def __init__(
+        self,
+        gst_size=128,
+        n_style_token=10,
+        n_style_attn_head=4,
+        use_flash=False,
+        **kwargs,
+    ):
         super(StyleAttention, self).__init__()
 
         token_size = gst_size // n_style_attn_head
         self.tokens = torch.nn.Parameter(torch.FloatTensor(n_style_token, token_size))
         self.mha = torch.nn.MultiheadAttention(
-            embed_dim=gst_size,
+            embed_dim=gst_size,  # n_head * d_head
             num_heads=n_style_attn_head,
             dropout=0.0,
             bias=True,
@@ -614,6 +697,39 @@ class StyleAttention(NeuralModule):
         style_emb, _ = self.mha(query=query, key=tokens, value=tokens)
         style_emb = style_emb.squeeze(1)
         return style_emb
+
+
+class ConvReLUNorm(torch.nn.Module, adapter_mixins.AdapterModuleMixin):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=1,
+        dropout=0.0,
+        condition_dim=384,
+        condition_types=[],
+    ):
+        super(ConvReLUNorm, self).__init__()
+        self.conv = torch.nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            padding=(kernel_size // 2),
+        )
+        self.norm = ConditionalLayerNorm(
+            out_channels, condition_dim=condition_dim, condition_types=condition_types
+        )
+        self.dropout = torch.nn.Dropout(dropout)
+
+    def forward(self, signal, conditioning=None):
+        out = torch.nn.functional.relu(self.conv(signal))
+        out = self.norm(out.transpose(1, 2), conditioning).transpose(1, 2)
+        out = self.dropout(out)
+
+        if self.is_adapter_available():
+            out = self.forward_enabled_adapters(out.transpose(1, 2)).transpose(1, 2)
+
+        return out
 
 
 class Conv2DReLUNorm(torch.nn.Module):
@@ -758,6 +874,8 @@ class GlobalStyleToken(NeuralModule):
         gst_size=128,
         n_style_token=10,
         n_style_attn_head=4,
+        use_flash=False,
+        **kwargs,
     ):
         super(GlobalStyleToken, self).__init__()
         self.reference_encoder = reference_encoder
@@ -765,6 +883,8 @@ class GlobalStyleToken(NeuralModule):
             gst_size=gst_size,
             n_style_token=n_style_token,
             n_style_attn_head=n_style_attn_head,
+            use_flash=use_flash,
+            **kwargs,
         )
 
     @property
@@ -876,11 +996,3 @@ class SpeakerEncoder(NeuralModule):
                 )
 
         return embs
-
-
-# Activations
-class Swish(torch.nn.SiLU):
-    """
-    Swish activation function introduced in 'https://arxiv.org/abs/1710.05941'
-    Mathematically identical to SiLU. See note in nn.SiLU for references.
-    """

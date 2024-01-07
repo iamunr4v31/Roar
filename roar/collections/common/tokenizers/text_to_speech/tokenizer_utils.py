@@ -47,7 +47,10 @@ def get_characters_from_range(start_range, end_range):
     characters_in_range = [
         chr(char_code) for char_code in range(start_range, end_range + 1)
     ]
-    return characters_in_range
+    valid_characters = [
+        char for char in characters_in_range if unicodedata.category(char) != "Cn"
+    ]
+    return sorted(valid_characters)
 
 
 def english_text_preprocessing(text, lower=True):

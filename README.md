@@ -13,6 +13,12 @@ pip install Cython
 pip install -r requirements.txt
 ```
 
+Optionally to use flash attention:
+```
+pip install flash-attn --no-build-isolation
+```
+**Note**: You need Ampere or newer gpus to run flash attention and the CUDA version should be >= 11.6
+
 After installing the requirements, 
 
 ### Step 1:
@@ -58,10 +64,8 @@ A more in-depth tutorial will be added soon.
 - [ ] Relative Position Embeddings
 - [ ] Rotary Position Embeddings
 - [ ] Sparse Attention
-- [ ] WaveGrad
-- [ ] GlowTTS
-- [ ] FastDiff
 - [ ] WaveNet
+- [ ] FastDiff
 
 ---
 **Disclaimer**: All the code in this repository, forked from NeMo, follows the licensing of the original NeMo repository. The code is provided as-is for research purposes only and without any guarantees. Please contact the original authors for any commercial use.

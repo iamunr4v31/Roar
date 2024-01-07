@@ -8,9 +8,8 @@ from roar.collections.tts.modules.submodules import (
     ConditionalInput,
     ConditionalLayerNorm,
     LinearNorm,
-    Swish,
 )
-import roar.collections.tts.modules.submodules as submodules
+from roar.collections.tts.modules import activations
 from roar.collections.tts.modules.postional_embedding import PositionalEmbedding
 from roar.collections.tts.modules.attention import MultiHeadAttn
 from roar.collections.tts.parts.utils.helpers import get_mask_from_lengths
@@ -22,7 +21,6 @@ from roar.core.neural_types.elements import (
     MaskType,
     TokenIndex,
 )
-from roar.core.neural_types.neural_type import NeuralType
 
 
 # TODO: move mask_from_lens to roar.collections.tts.parts.utils.helpers
@@ -48,7 +46,7 @@ class ConvolutionalModule(nn.Module):
     ) -> None:
         assert kernel_size - 1 % 2 == 1, "kernel size must be odd for 'SAME' padding"
         assert hasattr(nn, activation_fn) or hasattr(
-            submodules, activation_fn
+            activations, activation_fn
         ), f"Activation function {activation_fn} not found in torch.nn"
         super(ConvolutionalModule, self).__init__()
         self.embed_dim = embed_dim
@@ -58,7 +56,7 @@ class ConvolutionalModule(nn.Module):
         if hasattr(nn, activation_fn):
             self.depthwise_activation = getattr(nn, activation_fn)()
         else:  # alias for SiLU in Swish
-            self.depthwise_activation = getattr(submodules, activation_fn)()
+            self.depthwise_activation = getattr(activations, activation_fn)()
 
         self.CoreNet = nn.Sequential(
             nn.Conv1d(
@@ -127,13 +125,13 @@ class PositionwiseFF(nn.Module):
         bias=True,
     ) -> None:
         assert hasattr(nn, activation_fn) or hasattr(
-            submodules, activation_fn
+            activations, activation_fn
         ), f"Activation function {activation_fn} not found in torch.nn"
         super(PositionwiseFF, self).__init__()
         if hasattr(nn, activation_fn):
             self.activation = getattr(nn, activation_fn)()
         else:  # alias for SiLU in Swish
-            self.activation = getattr(submodules, activation_fn)()
+            self.activation = getattr(activations, activation_fn)()
         self.CoreNet = nn.Sequential(
             nn.Linear(embed_dim, hidden_size, bias=bias),
             self.activation(),

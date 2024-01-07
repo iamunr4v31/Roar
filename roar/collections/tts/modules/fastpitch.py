@@ -3,6 +3,7 @@ import torch
 from roar.collections.tts.modules.submodules import (
     ConditionalInput,
     ConditionalLayerNorm,
+    ConvReLUNorm,
 )
 from roar.collections.tts.parts.utils.helpers import (
     binarize_attention_parallel,
@@ -55,39 +56,6 @@ def log_to_duration(log_dur, min_dur, max_dur, mask):
     dur = torch.clamp(torch.exp(log_dur) - 1.0, min_dur, max_dur)
     dur *= mask.squeeze(2)
     return dur
-
-
-class ConvReLUNorm(torch.nn.Module, adapter_mixins.AdapterModuleMixin):
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        kernel_size=1,
-        dropout=0.0,
-        condition_dim=384,
-        condition_types=[],
-    ):
-        super(ConvReLUNorm, self).__init__()
-        self.conv = torch.nn.Conv1d(
-            in_channels,
-            out_channels,
-            kernel_size=kernel_size,
-            padding=(kernel_size // 2),
-        )
-        self.norm = ConditionalLayerNorm(
-            out_channels, condition_dim=condition_dim, condition_types=condition_types
-        )
-        self.dropout = torch.nn.Dropout(dropout)
-
-    def forward(self, signal, conditioning=None):
-        out = torch.nn.functional.relu(self.conv(signal))
-        out = self.norm(out.transpose(1, 2), conditioning).transpose(1, 2)
-        out = self.dropout(out)
-
-        if self.is_adapter_available():
-            out = self.forward_enabled_adapters(out.transpose(1, 2)).transpose(1, 2)
-
-        return out
 
 
 class TemporalPredictor(NeuralModule):
